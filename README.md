@@ -29,6 +29,15 @@ duplicates, check assays, Westgard rules); SPC control charts (individuals chart
 **Phase 4 - Gold room and reports.** Dore bars, fine gold, fineness, smelt recovery, reconciliation of
 bars against daily poured gold; targets and plan vs actual; daily (1 page) and monthly (2 page) PDFs.
 
+**Ore grade scanner (new tab).** Photograph crushed rock (camera or upload). The app outlines the rock and
+measures dark sulphide area, rust, quartz, colour, texture and fragment size, using the empty tray as the
+exposure/colour reference. Gold is invisible in a photo, so the grade comes only from a ridge-regression
+calibration learned from YOUR scans that have lab assays (needs 15+, aim for 40+), tested leave-one-out.
+Until calibrated it shows measurements only; it reports typical error, flags poor calibration and photos unlike
+the calibration set, and calls Above / Below / Near the cut-off (near = send to lab). Demo scans use computer-drawn
+photos with an invented grade link: they show how it works, not how accurate it will be on your ore.
+Photo method must stay identical: same tray, light, camera height, dry single layer.
+
 ## Calibrate before real use
 All limits (cyanide, DO, pH, carbon loading/activity, solution loss, QA/QC tolerances, targets) are
 generic defaults. Set them in **Settings** to your plant's values. Tank volumes must be entered.

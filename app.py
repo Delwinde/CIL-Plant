@@ -15,6 +15,7 @@ import circuit
 import goldroom
 import qaqc
 import report
+import scanner
 import sample_data
 import spc
 import storage
@@ -208,7 +209,7 @@ alerts = in_range(alerts_all, start, end) if not alerts_all.empty else alerts_al
 
 st.sidebar.divider()
 c1, c2 = st.sidebar.columns(2)
-has_data = not raw.empty or not tanks_raw.empty or not qa_raw.empty or not pours_raw.empty
+has_data = not raw.empty or not tanks_raw.empty or not qa_raw.empty or not pours_raw.empty or not storage.load_table("scans").empty
 if c1.button("Load demo data"):
     if has_data:
         st.session_state["confirm_demo"] = True
@@ -239,9 +240,9 @@ if raw.empty:
     st.info("No data yet. Add a day in **Daily entry**, import a CSV/Excel file, restore a backup, or click "
             "**Load demo data** in the sidebar.")
 
-(tab_dash, tab_entry, tab_circ, tab_rec, tab_reag, tab_ore, tab_qa, tab_gold, tab_spc, tab_alerts, tab_dq,
+(tab_dash, tab_entry, tab_circ, tab_rec, tab_reag, tab_ore, tab_scan, tab_qa, tab_gold, tab_spc, tab_alerts, tab_dq,
  tab_rep, tab_set) = st.tabs(["📊 Dashboard", "✍️ Daily entry", "🧪 Circuit & carbon", "⚖️ Reconciliation",
-                              "⚡ Reagents", "🪨 Ore types", "🔬 Lab QA/QC", "🪙 Gold room",
+                              "⚡ Reagents", "🪨 Ore types", "📷 Ore scanner", "🔬 Lab QA/QC", "🪙 Gold room",
                               "📈 Control charts", "🚨 Alerts", "✅ Data quality", "📄 Reports", "⚙️ Settings"])
 
 # ───────────────────────── dashboard ─────────────────────────
@@ -1092,6 +1093,191 @@ with tab_rep:
         except Exception as ex:  # noqa: BLE001
             st.error(f"That file could not be restored: {ex}")
 
+# ───────────────────────── ore scanner ─────────────────────────
+@st.cache_data(show_spinner=False)
+def _analyse_cached(data: bytes, tray_ref: bool):
+    return scanner.analyse(data, tray_ref)
+
+
+with tab_scan:
+    SC = S["scanner"]
+    scans = storage.load_table("scans")
+    cutoff = float(SC["cutoff_gpt"])
+    model = scanner.fit(scans, int(SC["min_scans"]))
+    n_lab = len(scanner.labelled(scans))
+    st.caption("Photograph crushed rock, and the app measures what a camera can see: dark sulphide grains, rust, "
+               "quartz, colour, texture. Gold itself is invisible, so the grade comes only from the link your own mine's "
+               "photos have with lab assays. Until that link is learned, the app shows measurements and no grade.")
+    k = st.columns(4)
+    k[0].metric("Scans saved", len(scans))
+    k[1].metric("Scans with a lab assay", f"{n_lab} / {int(SC['min_scans'])} needed")
+    if model:
+        k[2].metric("Typical error", f"± {1.96 * model['loo_rmse']:.2f} g/t",
+                    help="95% of leave-one-out test predictions fell within this of the lab assay.")
+        k[3].metric("Calibration quality", model["quality"], f"R² {model['loo_r2']:.2f}", delta_color="off")
+    else:
+        k[2].metric("Typical error", "–")
+        k[3].metric("Calibration quality", "Not calibrated")
+
+    s_scan, s_cal, s_hist = st.tabs(["📷 Scan a sample", "Calibration", "History"])
+
+    with s_scan:
+        how = st.radio("Photo source", ["Take a photo", "Upload a photo", "Try a made-up photo"],
+                       horizontal=True, key="scan_how")
+        data, is_demo = None, False
+        if how == "Take a photo":
+            shot = st.camera_input("Photograph the rock on the tray", key="scan_cam")
+            data = shot.getvalue() if shot else None
+        elif how == "Upload a photo":
+            up = st.file_uploader("Choose a photo (JPG or PNG)", type=["jpg", "jpeg", "png"], key="scan_up")
+            data = up.getvalue() if up else None
+        else:
+            if st.button("Make a new practice photo", key="scan_mk"):
+                rng_ = np.random.default_rng()
+                st.session_state["scan_demo"] = scanner.synthetic_rock_image(
+                    float(rng_.uniform(0.5, 5.5)), str(rng_.choice(["Oxide", "Transition", "Fresh"])), rng_,
+                    float(rng_.uniform(0.85, 1.1)))
+            data, is_demo = st.session_state.get("scan_demo"), True
+            st.caption("A computer-drawn picture for practice. Its darkness-to-grade link is invented.")
+        tray_ref = st.checkbox("Use the empty tray as the colour reference (recommended)", True, key="scan_ref")
+
+        if data is None:
+            st.info("Spread the crushed rock in one layer on a plain tray, leave empty tray showing at the edges, "
+                    "use the same light and the same camera height every time, then take the photo.")
+        else:
+            try:
+                res = _analyse_cached(data, tray_ref)
+            except Exception:
+                res = None
+                st.error("That file could not be read as a photo. Try another one.")
+            if res:
+                f = res["features"]
+                a, b = st.columns(2)
+                a.image(res["image"], caption="Your photo", use_container_width=True)
+                b.image(scanner.overlay(res["image"], res["mask"]), caption="What was measured (orange outline = rock)",
+                        use_container_width=True)
+                for w_ in res["warnings"]:
+                    st.warning(w_)
+                if model:
+                    p = scanner.predict(model, f, cutoff)
+                    r1, r2_, r3 = st.columns(3)
+                    r1.metric("Estimated grade", f"{p['grade_gpt']:.2f} g/t")
+                    r2_.metric("Likely range", f"{p['low']:.2f} to {p['high']:.2f} g/t")
+                    r3.metric(f"Against cut-off ({cutoff:g} g/t)", p["call"])
+                    if model["quality"] == "Poor":
+                        st.error("The calibration is poor: photos on this mine do not predict the assay well yet. "
+                                 "Do not use this number. Add more assayed scans and keep the photo method identical.")
+                    elif model["quality"] == "Fair":
+                        st.warning("The calibration is only fair. Use it to screen, and send anything near the cut-off to the lab.")
+                    if p["unfamiliar"]:
+                        st.warning("This photo looks unlike the calibration photos (different light, tray or rock). "
+                                   "Treat the estimate with caution.")
+                    guess = scanner.classify_ore_type(scans, f)
+                    if guess:
+                        st.caption(f"Colour and texture look most like **{guess[0]}** ore from your earlier scans.")
+                else:
+                    st.info(f"No grade yet: {max(0, int(SC['min_scans']) - n_lab)} more scans with a lab assay are needed "
+                            "before the app can learn the link between photos and grade. Save this scan, and add its lab "
+                            "assay later in History.")
+                show = ["dark_frac", "light_frac", "rust_frac", "mean_v", "texture", "cover_frac", "n_particles", "d50_rel"]
+                pct = {"dark_frac", "light_frac", "rust_frac", "cover_frac"}
+                st.dataframe(pd.DataFrame({
+                    "Measurement": [scanner.FEATURE_LABELS[c] for c in show],
+                    "Value": [f"{f[c] * 100:.1f}%" if c in pct else f"{f[c]:.2f}" for c in show]}),
+                    hide_index=True, use_container_width=True)
+                with st.form("scan_form", clear_on_submit=True):
+                    a, b, c_, e = st.columns(4)
+                    sc_date = a.date_input("Date", pd.Timestamp.today().date(), key="sc_date")
+                    sc_id = b.text_input("Sample ID", key="sc_id")
+                    sc_ore = c_.selectbox("Ore type", ["", "Oxide", "Transition", "Fresh"], key="sc_ore")
+                    sc_loc = e.text_input("Where from (stockpile, bench, belt)", key="sc_loc")
+                    a, b = st.columns([1, 3])
+                    sc_assay = a.number_input("Lab assay (g/t), if known", 0.0, 1000.0, 0.0, 0.001, format="%.3f",
+                                              help="Leave at 0 if not assayed yet; add it later in History.", key="sc_assay")
+                    sc_note = b.text_input("Note", key="sc_note")
+                    if st.form_submit_button("Save this scan"):
+                        row = pd.DataFrame([{"date": pd.Timestamp(sc_date),
+                                             "sample_id": sc_id or f"SCAN-{pd.Timestamp.now():%Y%m%d-%H%M%S}",
+                                             "ore_type": sc_ore or None, "location": sc_loc or None,
+                                             "assay_gpt": sc_assay if sc_assay > 0 else None,
+                                             "note": ("practice photo. " if is_demo else "") + sc_note, **f}])
+                        storage.save_rows("scans", row)
+                        st.success("Scan saved.")
+                        st.rerun()
+
+    with s_cal:
+        if not model:
+            st.info(f"Needs at least {int(SC['min_scans'])} scans with a lab assay (you have {n_lab}). "
+                    "Aim for 40 or more, spread across low, medium and high grade and across ore types.")
+        else:
+            st.markdown(f"Calibrated on **{model['n']}** assayed scans. Each dot is a scan the model had **not seen** "
+                        "when predicting it (leave-one-out test), so this is an honest picture of performance.")
+            cal = pd.DataFrame({"assay": model["loo_actual"], "pred": model["loo_pred"]})
+            top = float(max(cal.max()) * 1.05)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=[0, top], y=[0, top], mode="lines", name="Perfect",
+                                     line=dict(width=1, dash="dash", color=GREY), hoverinfo="skip"))
+            fig.add_trace(go.Scatter(x=cal["assay"], y=cal["pred"], mode="markers", name="Scan",
+                                     marker=dict(size=8, color=BLUE, opacity=0.8),
+                                     hovertemplate="Lab %{x:.2f}, photo %{y:.2f} g/t"))
+            fig = style_fig(fig, 380, "Estimated from photo (g/t)", legend=True)
+            fig.update_xaxes(title="Lab assay (g/t)", range=[0, top])
+            fig.update_yaxes(range=[0, top])
+            st.plotly_chart(fig, use_container_width=True)
+            wdf = pd.DataFrame({"feature": [scanner.FEATURE_LABELS[c] for c in model["features"]], "w": model["w"]})
+            wdf = wdf.reindex(wdf["w"].abs().sort_values(ascending=False).index)
+            st.markdown("**What the model leans on** (positive = more of this means higher grade)")
+            st.plotly_chart(bar_chart(wdf, "w", "Weight", x="feature", height=300, fmt="%{y:+.2f}"),
+                            use_container_width=True)
+            if model["quality"] == "Poor":
+                st.error("Poor calibration. Photos are not tracking the assays. Check the photo method is identical "
+                         "each time (light, height, tray, dry rock), and whether grade on this deposit has any visible signature.")
+        st.markdown("**Keeping photos comparable:** same tray colour, same light (a closed box is best), same camera "
+                    "height, dry rock in a single layer, similar crush size, and a lab assay on the same sample you photographed. "
+                    "Re-check against the lab every month, and again after any change of ore source or lighting.")
+
+    with s_hist:
+        if scans.empty:
+            st.info("No scans saved yet.")
+        else:
+            h = scans.copy()
+            h["photo_estimate_gpt"] = scanner.predict_all(model, h) if model else np.nan
+            if model:
+                loo = pd.Series(model["loo_pred"], index=scanner.labelled(scans).index)
+                h.loc[loo.index, "photo_estimate_gpt"] = loo       # tested value for assayed scans
+            cols = ["date", "sample_id", "ore_type", "location", "assay_gpt", "photo_estimate_gpt", "dark_frac",
+                    "rust_frac", "note"]
+            shown = h.sort_values("date", ascending=False)[["id", *cols]].head(200).copy()
+            shown["date"] = shown["date"].dt.date
+            st.dataframe(shown.rename(columns={"assay_gpt": "lab_assay_gpt"}), hide_index=True,
+                         use_container_width=True, height=300)
+            est = h.dropna(subset=["photo_estimate_gpt"])
+            if len(est) > 1:
+                st.markdown("**Photo estimate over time** (g/t)")
+                st.plotly_chart(line_chart(est.sort_values("date"), [("photo_estimate_gpt", "Photo estimate", BLUE)],
+                                           "g/t", height=260, hlines=[(cutoff, "Cut-off")]), use_container_width=True)
+            a, b = st.columns(2)
+            pend = h[h["assay_gpt"].isna()]
+            with a:
+                st.markdown("**Add a lab assay to a saved scan**")
+                if pend.empty:
+                    st.caption("Every saved scan already has an assay.")
+                else:
+                    opts = {f"{r.sample_id} ({r.date:%d %b %Y})": int(r.id) for r in pend.itertuples()}
+                    pick = st.selectbox("Scan", list(opts), key="sc_pick")
+                    val = st.number_input("Lab assay (g/t)", 0.0, 1000.0, 0.0, 0.001, format="%.3f", key="sc_val")
+                    if st.button("Save assay", key="sc_saveassay") and val > 0:
+                        storage.update_cells("scans", opts[pick], {"assay_gpt": val})
+                        st.rerun()
+            with b:
+                st.markdown("**Delete a scan**")
+                del_opts = {f"{r.sample_id} ({r.date:%d %b %Y})": int(r.id) for r in h.itertuples()}
+                dpick = st.selectbox("Scan", list(del_opts), key="sc_delpick")
+                if st.button("Delete this scan", key="sc_del"):
+                    storage.delete_ids("scans", [del_opts[dpick]])
+                    st.rerun()
+
+
 # ───────────────────────── settings ─────────────────────────
 with tab_set:
     st.caption("Settings are saved with your data. Set these to match your plant before relying on the alerts and reports.")
@@ -1143,8 +1329,12 @@ with tab_set:
     new_vols = [float(vcols[i % len(vcols)].number_input(f"Tank {i + 1} volume (m³)", 1.0, 20000.0,
                                                           float(tank_vols[i] if i < len(tank_vols) else tank_vols[-1]), 10.0,
                                                           key=f"set_vol_{i}")) for i in range(nt)]
+    st.subheader("Ore scanner")
+    sc1, sc2 = st.columns(2)
+    n_scan = {"cutoff_gpt": numfield("Cut-off grade for scanner calls (g/t)", S["scanner"]["cutoff_gpt"], 0, 50, 0.1, "set_sc1"),
+              "min_scans": int(numfield("Assayed scans needed before it gives a grade", S["scanner"]["min_scans"], 8, 200, 1, "set_sc2", "%d"))}
     if st.button("Save settings", type="primary"):
         storage.save_settings({"plant_name": new_name, "costs": n_costs, "targets": n_targets, "spc": n_spc,
-                               "thresholds": n_th, "circuit": {**n_circ, "tank_volumes_m3": new_vols}, "qaqc": n_q})
+                               "thresholds": n_th, "circuit": {**n_circ, "tank_volumes_m3": new_vols}, "qaqc": n_q, "scanner": n_scan})
         st.success("Settings saved.")
         st.rerun()

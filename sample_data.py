@@ -21,6 +21,8 @@ Ore type changes in campaigns of 5 to 15 days (oxide, transition, fresh), each w
 from __future__ import annotations
 
 import numpy as np
+
+import scanner
 import pandas as pd
 
 import circuit
@@ -213,7 +215,8 @@ def generate_all(start="2026-06-01", end="2026-09-30", seed=7) -> dict[str, pd.D
             last = idx + 1
     pours = pd.DataFrame(pours)
 
-    return {"daily": daily, "tanks": tanks, "carbon_log": carbon_log, "qaqc": qaqc, "pours": pours}
+    return {"daily": daily, "tanks": tanks, "carbon_log": carbon_log, "qaqc": qaqc, "pours": pours,
+            "scans": scanner.synthetic_scans()}
 
 
 def generate(start="2026-06-01", end="2026-09-30", seed=7) -> pd.DataFrame:

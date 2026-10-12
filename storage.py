@@ -56,6 +56,14 @@ SCHEMAS: dict[str, dict] = {
         "cols": [("date", "TEXT"), ("bar_no", "TEXT"), ("gross_g", "REAL"), ("au_pct", "REAL"),
                  ("ag_pct", "REAL"), ("slag_au_g", "REAL")],
     },
+    "scans": {
+        "id": True,
+        "cols": [("date", "TEXT"), ("sample_id", "TEXT"), ("ore_type", "TEXT"), ("location", "TEXT"),
+                 ("assay_gpt", "REAL"), ("note", "TEXT")]
+                + [(c, "REAL") for c in ("mean_v", "std_v", "mean_s", "r_frac", "b_frac", "dark_frac",
+                                         "light_frac", "rust_frac", "texture", "cover_frac",
+                                         "n_particles", "d50_rel")],
+    },
 }
 DATA_TABLES = list(SCHEMAS)
 
@@ -72,6 +80,7 @@ DEFAULT_SETTINGS = {
     "targets": {"recovery_pct": 92.0, "head_gpt": 2.5, "tails_gpt": 0.2, "throughput_tph": 165.0,
                 "availability_pct": 90.0, "nacn_kgpt": 0.55, "power_kwhpt": 22.0, "unaccounted_pct": 1.0},
     "spc": {"baseline_days": 30},
+    "scanner": {"cutoff_gpt": 1.0, "min_scans": 15},
 }
 
 
@@ -158,6 +167,18 @@ def replace_day(table: str, date_str: str, df: pd.DataFrame, path=None) -> int:
     with _conn(path) as c:
         c.execute(f"DELETE FROM {table} WHERE date = ?", (date_str,))
     return save_rows(table, df, path) if len(df) else 0
+
+
+def update_cells(table: str, row_id: int, values: dict, path=None):
+    """Change named columns of one row of an id table (used to add a lab assay to a saved scan)."""
+    init(path)
+    allowed = set(_names(table))
+    vals = {k: _py(v) for k, v in values.items() if k in allowed}
+    if not vals:
+        return
+    with _conn(path) as c:
+        c.execute(f"UPDATE {table} SET " + ", ".join(f"{k} = ?" for k in vals) + " WHERE id = ?",
+                  [*vals.values(), int(row_id)])
 
 
 def delete_ids(table: str, ids, path=None):
