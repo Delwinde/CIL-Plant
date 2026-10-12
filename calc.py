@@ -1,12 +1,17 @@
 """Metallurgical accounting engine for a gold CIL/CIP plant.
 
 All inputs are daily plant figures. Units:
-    tonnes_milled     dry tonnes
-    head_grade_gpt    g/t (assayed feed grade)
-    tails_grade_gpt   g/t (final residue, solids + solution equivalent)
-    gold_poured_g     grams of gold in doré poured/produced that day
-    inventory_change_g  change in in-circuit gold (carbon, tanks, elution) in g;
-                        positive = inventory built up (counts as gold recovered)
+    tonnes_milled        dry tonnes
+    head_grade_gpt       g/t (assayed feed grade)
+    tails_grade_gpt      g/t total residue grade (solids + dissolved gold lost with the water)
+    tails_solid_gpt      g/t gold in the residue solids (optional, replaces tails_grade_gpt)
+    tails_solution_mgl   mg/L gold in the residue solution (optional)
+    tails_pct_solids     % solids by mass of the residue slurry (needed for the solution loss)
+    gold_poured_g        grams of FINE gold produced that day (gross doré weight x Au fineness)
+    inventory_change_g   change in in-circuit gold (carbon, tanks, elution) in g;
+                         positive = inventory built up (counts as gold recovered).
+                         Calculated automatically from tank readings when those are recorded.
+    other_inventory_g    gold held outside the tanks (elution column, cells, kiln carbon), in g
 """
 from __future__ import annotations
 
@@ -17,21 +22,16 @@ import pandas as pd
 
 G_PER_OZ = 31.1035
 
-INPUT_COLUMNS = [
-    "date",
-    "tonnes_milled",
-    "mill_hours",
-    "scheduled_hours",
-    "head_grade_gpt",
-    "tails_grade_gpt",
-    "gold_poured_g",
-    "inventory_change_g",
-    "nacn_kg",
-    "lime_kg",
-    "power_kwh",
-    "model_grade_gpt",  # optional: geological/grade-control model prediction
+NUMERIC_INPUTS = [
+    "tonnes_milled", "mill_hours", "scheduled_hours", "head_grade_gpt", "tails_grade_gpt",
+    "gold_poured_g", "inventory_change_g", "nacn_kg", "lime_kg", "power_kwh",
+    "model_grade_gpt",      # optional: geological/grade-control model prediction
+    "tails_solid_gpt", "tails_solution_mgl", "tails_pct_solids", "other_inventory_g",
 ]
-REQUIRED_COLUMNS = INPUT_COLUMNS[:-1]  # everything except model_grade_gpt
+TEXT_INPUTS = ["ore_type"]
+INPUT_COLUMNS = ["date"] + NUMERIC_INPUTS + TEXT_INPUTS
+REQUIRED_COLUMNS = ["date", "tonnes_milled", "mill_hours", "scheduled_hours", "head_grade_gpt",
+                    "gold_poured_g", "nacn_kg", "lime_kg", "power_kwh"]
 
 
 @dataclass
@@ -49,6 +49,7 @@ class AlertThresholds:
     head_gap_pct: float = 5.0            # |assay head - calculated head|
     reagent_spike_factor: float = 1.25   # vs trailing 7-day mean
     min_availability_pct: float = 85.0
+    solution_loss_pct: float = 25.0      # dissolved gold as % of tails gold
 
 
 def two_product_recovery(f, c, t):
@@ -69,16 +70,43 @@ def _safe_div(a, b):
     return a / b.where(b > 0)
 
 
+def resolve_tails(df: pd.DataFrame) -> pd.DataFrame:
+    """Work out the total tails grade from its parts when they are supplied.
+
+    Solution loss (g per tonne of solids) = solution grade (mg/L = g/m3) x water per tonne of
+    solids (m3/t) = tails_solution_mgl x (100 - %solids) / %solids.
+    Total tails = solid tails + solution loss. When tails_solid_gpt is given it takes priority
+    over a typed total. Adds solution_loss_gpt and solution_loss_pct_of_tails.
+    """
+    d = df.copy()
+    for c in ("tails_grade_gpt", "tails_solid_gpt", "tails_solution_mgl", "tails_pct_solids"):
+        if c not in d.columns:
+            d[c] = np.nan
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    ps = d["tails_pct_solids"]
+    ratio = ((100 - ps) / ps).where((ps > 0) & (ps < 100))
+    d["solution_loss_gpt"] = d["tails_solution_mgl"] * ratio
+    has_solid = d["tails_solid_gpt"].notna()
+    parts = d["tails_solid_gpt"] + d["solution_loss_gpt"].fillna(0)
+    d["tails_grade_gpt"] = d["tails_grade_gpt"].where(~has_solid, parts)
+    d["solution_loss_pct_of_tails"] = _safe_div(d["solution_loss_gpt"], d["tails_grade_gpt"]) * 100
+    return d
+
+
 def compute_daily(df: pd.DataFrame, costs: Costs | None = None) -> pd.DataFrame:
     """Add all derived metallurgical columns. Does not drop or alter inputs."""
     costs = costs or Costs()
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"])
     d = d.sort_values("date", kind="stable").reset_index(drop=True)
-    for col in INPUT_COLUMNS[1:]:
+    for col in NUMERIC_INPUTS:
         if col not in d.columns:
             d[col] = np.nan
         d[col] = pd.to_numeric(d[col], errors="coerce")
+    for col in TEXT_INPUTS:
+        if col not in d.columns:
+            d[col] = None
+    d = resolve_tails(d)
 
     t = d["tonnes_milled"]
     # --- throughput / time ---
@@ -157,6 +185,12 @@ def build_alerts(d: pd.DataFrame, th: AlertThresholds | None = None) -> pd.DataF
         if pd.notna(r["availability_pct"]) and r["availability_pct"] < th.min_availability_pct:
             add(r, "info", "Low availability",
                 f"Mill availability {r['availability_pct']:.0f}% of scheduled hours.")
+        sl = r.get("solution_loss_pct_of_tails")
+        if pd.notna(sl) and sl > th.solution_loss_pct:
+            add(r, "warning", "Dissolved gold loss",
+                f"{sl:.0f}% of the tails gold is dissolved in the solution "
+                f"({r['solution_loss_gpt']:.3f} g/t). Gold is leaching but not adsorbing: "
+                "check carbon activity, carbon concentration and cyanide/oxygen in the last tanks.")
     cols = ["date", "severity", "type", "message"]
     return pd.DataFrame(out, columns=cols)
 
@@ -166,10 +200,12 @@ def _weighted(g: pd.DataFrame) -> pd.Series:
     feed = g["feed_gold_g"].sum()
     tails = g["tails_gold_g"].sum()
     rec = g["gold_recovered_g"].sum()
+    hours = g["mill_hours"].sum()
     res = {
         "days": len(g),
         "tonnes_milled": t,
-        "mill_hours": g["mill_hours"].sum(),
+        "mill_hours": hours,
+        "tph": t / hours if hours else np.nan,
         "head_grade_gpt": feed / t if t else np.nan,
         "tails_grade_gpt": tails / t if t else np.nan,
         "recovery_grade_pct": (feed - tails) / feed * 100 if feed else np.nan,
@@ -180,9 +216,15 @@ def _weighted(g: pd.DataFrame) -> pd.Series:
         "nacn_kgpt": g["nacn_kg"].sum() / t if t else np.nan,
         "lime_kgpt": g["lime_kg"].sum() / t if t else np.nan,
         "power_kwhpt": g["power_kwh"].sum() / t if t else np.nan,
-        "availability_pct": (g["mill_hours"].sum() / g["scheduled_hours"].sum() * 100
+        "availability_pct": (hours / g["scheduled_hours"].sum() * 100
                              if g["scheduled_hours"].sum() else np.nan),
     }
+    if "solution_loss_gpt" in g and g["solution_loss_gpt"].notna().any():
+        m = g[g["solution_loss_gpt"].notna()]
+        sol_gold = (m["tonnes_milled"] * m["solution_loss_gpt"]).sum()
+        res["solution_loss_pct_of_tails"] = sol_gold / m["tails_gold_g"].sum() * 100 if m["tails_gold_g"].sum() else np.nan
+    else:
+        res["solution_loss_pct_of_tails"] = np.nan
     if "model_grade_gpt" in g and g["model_grade_gpt"].notna().any():
         m = g.loc[g["model_grade_gpt"].notna()]
         model_metal = (m["tonnes_milled"] * m["model_grade_gpt"]).sum()
@@ -203,6 +245,52 @@ def summarise(d: pd.DataFrame, freq: str = "M") -> pd.DataFrame:
     d = d.copy()
     d["period"] = d["date"].dt.to_period(freq).astype(str)
     return d.groupby("period", sort=True).apply(_weighted, include_groups=False).reset_index()
+
+
+def by_ore_type(d: pd.DataFrame) -> pd.DataFrame:
+    """Tonnage-weighted performance for each ore type, plus each type's share of the tonnes."""
+    x = d.copy()
+    x["ore_type"] = x["ore_type"].fillna("Unspecified").astype(str).replace("", "Unspecified")
+    out = x.groupby("ore_type", sort=True).apply(_weighted, include_groups=False).reset_index()
+    total = out["tonnes_milled"].sum()
+    out["share_pct"] = out["tonnes_milled"] / total * 100 if total else np.nan
+    return out
+
+
+# metric label, targets key, actual column in overall(), direction, use absolute value?
+_PLAN_ROWS = [
+    ("Recovery (%)", "recovery_pct", "recovery_grade_pct", "higher", False),
+    ("Head grade (g/t)", "head_gpt", "head_grade_gpt", "higher", False),
+    ("Tails grade (g/t)", "tails_gpt", "tails_grade_gpt", "lower", False),
+    ("Throughput (t/h)", "throughput_tph", "tph", "higher", False),
+    ("Availability (%)", "availability_pct", "availability_pct", "higher", False),
+    ("NaCN (kg/t)", "nacn_kgpt", "nacn_kgpt", "lower", False),
+    ("Power (kWh/t)", "power_kwhpt", "power_kwhpt", "lower", False),
+    ("Unaccounted gold (%)", "unaccounted_pct", "unaccounted_pct", "lower", True),
+]
+
+
+def plan_vs_actual(actual: pd.Series, targets: dict) -> pd.DataFrame:
+    """Compare period results with targets.
+
+    Status: On target (at or better than target, allowing 0.5 % of rounding), Slightly behind
+    (up to 2 % short on a 'higher is better' measure, or up to 5 % over on a 'lower is better' one),
+    Behind (anything worse).
+    """
+    rows = []
+    for label, tkey, acol, direction, use_abs in _PLAN_ROWS:
+        tgt = targets.get(tkey)
+        val = actual.get(acol, np.nan)
+        if tgt is None or pd.isna(val) or not tgt:
+            continue
+        v = abs(val) if use_abs else val
+        if direction == "higher":
+            status = "On target" if v >= 0.995 * tgt else "Slightly behind" if v >= 0.98 * tgt else "Behind"
+        else:
+            status = "On target" if v <= 1.005 * tgt else "Slightly behind" if v <= 1.05 * tgt else "Behind"
+        rows.append({"metric": label, "target": float(tgt), "actual": float(val),
+                     "variance": float(val - tgt), "status": status})
+    return pd.DataFrame(rows, columns=["metric", "target", "actual", "variance", "status"])
 
 
 def mine_call_factor(plant_metal_g: float, model_metal_g: float) -> float:

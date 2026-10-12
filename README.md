@@ -1,79 +1,40 @@
 # Gold CIL Plant: Metallurgical Accounting & Performance Dashboard
 
-Turns daily plant figures into recovery, gold reconciliation, reagent/energy cost, alerts
-and management reports. Built around how a plant metallurgist actually checks the books.
+Daily plant figures in; recovery, gold reconciliation, circuit control, lab quality, gold room and
+PDF reports out.
 
 ## Run it
-
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
+Click **Load demo data** in the sidebar to see everything working (122 days of synthetic data with
+deliberate faults), or import your own CSV/Excel (**Download blank template** gives the columns).
+Tests: `python -m pytest -q`.
 
-Click **Load demo data** in the sidebar to see it working (4 months of synthetic data with
-deliberate faults), or import your own CSV/Excel. Use **Download blank CSV template** for
-the exact column names. Data is stored in `plant.db` (SQLite) next to the app; no internet needed.
+## What is inside
+**Core:** daily entry with validation, recovery two ways (assay and gold produced), reconciliation,
+tonnage-weighted summaries, reagents and cost per t/oz, alerts, data-quality checks, Excel export.
 
-## Daily inputs (one row per day)
+**Phase 1 - Tails and inventory.** Total tails = solid tails + solution loss
+(solution mg/L x (100 - %solids)/%solids). In-circuit gold inventory is calculated from tank and carbon
+data; the day-to-day change replaces the typed inventory figure when both days are complete.
 
-| Column | Unit | Notes |
-|---|---|---|
-| date | | one record per day |
-| tonnes_milled | dry t | |
-| mill_hours / scheduled_hours | h | each ≤ 24 |
-| head_grade_gpt | g/t | assayed feed grade |
-| tails_grade_gpt | g/t | final residue |
-| gold_poured_g | g | dore / gold produced |
-| inventory_change_g | g | change in carbon/tank gold; + = built up. Blank = 0 |
-| nacn_kg, lime_kg, power_kwh | | daily usage |
-| model_grade_gpt | g/t | optional; grade-control/model grade for mine call factor |
+**Phase 2 - Circuit.** Per-tank leach profile (Au in solution, DO, pH, cyanide), residence time,
+carbon management (g/L, loading, activity, elutions, regenerations, carbon consumption).
 
-## What it calculates
+**Phase 3 - Ore and lab.** Ore type tracking and recovery by ore type; lab QA/QC (standards, blanks,
+duplicates, check assays, Westgard rules); SPC control charts (individuals charts, 3-sigma, run rules).
 
-- **Recovery two independent ways**: from assays `(head - tails) / head`, and from gold actually
-  produced `(poured + inventory change) / feed gold`. Disagreement = a sampling/accounting problem.
-- **Gold reconciliation**: feed = tails + recovered + **unaccounted**. Calculated head grade vs
-  assayed head grade.
-- **Monthly/weekly summaries are tonnage-weighted** from contained metal. Grades and recoveries are
-  never simply averaged.
-- Throughput (t/h), utilisation, availability, NaCN / lime / power per tonne, process cost per
-  tonne and per ounce, mine call factor.
-- `two_product_recovery(f, c, t)` is available in `calc.py` for the classic concentrator formula.
+**Phase 4 - Gold room and reports.** Dore bars, fine gold, fineness, smelt recovery, reconciliation of
+bars against daily poured gold; targets and plan vs actual; daily (1 page) and monthly (2 page) PDFs.
 
-## Data validation (the "never trust the data" layer)
+## Calibrate before real use
+All limits (cyanide, DO, pH, carbon loading/activity, solution loss, QA/QC tolerances, targets) are
+generic defaults. Set them in **Settings** to your plant's values. Tank volumes must be entered.
+Known simplification: gold in ore solids inside the tanks is not counted in inventory.
 
-Errors (excluded from KPIs by default): tails > head, mill hours > 24 or > scheduled, tonnes with
-zero hours, negative values, gold recovered greater than gold fed, duplicate dates, missing or
-non-numeric fields. Warnings: values outside plausible ranges (editable in `validation.py`),
-missing days, zero-tonnage days. The daily entry form blocks saving if there are errors.
-
-## Alerts (thresholds editable in the sidebar)
-
-Recovery more than 2 points below the previous 7-day mean · unaccounted gold ≥ 3% (warning) / 5%
-(critical) of feed · assay vs calculated head mismatch > 5% · cyanide > 1.25 × 7-day mean · low
-availability.
-
-## Tests
-
-```bash
-python -m pytest -q
-```
-
-21 tests cover the formulas against hand calculations, the mass-balance identity, weighted
-summaries, every validation rule, the alert logic, and the database.
-
-## Before using on a real plant, calibrate these
-
-1. **Plausible ranges** in `validation.py` (`LIMITS`) are generic CIL values. Set them to your plant.
-2. **Tails grade** is treated as one figure. If you sample solids and solution tails separately,
-   add the solution loss to the tails figure first.
-3. **Unit costs** in the sidebar are placeholders.
-4. **Inventory change** must come from your own carbon/in-circuit inventory method. If it's left at
-   0, normal inventory swings will show up as unaccounted gold.
-5. Check the formulas with your own senior metallurgist against one month of real data before
-   trusting the alerts.
-
-## Files
-
-`app.py` dashboard · `calc.py` calculations & alerts · `validation.py` checks · `storage.py` SQLite ·
-`sample_data.py` demo generator · `test_calc.py` tests
+## Storage, backup and privacy
+Data lives in SQLite (`plant.db`). Set `PLANT_DB_PATH` to put it on a persistent disk.
+On streamlit.app local files can be wiped on restart and the app is public unless you restrict it:
+use **Settings > Backup** regularly and prefer private hosting for real data. There is no login yet.
